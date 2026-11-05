@@ -1,0 +1,41 @@
+name: Mirror upstream
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-upstream
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Mirror branches and tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git clone --mirror https://github.com/aimod-cc/Agent2API.git upstream.git
+          cd upstream.git
+          git remote set-url --push origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+
+          # 逐个推送上游分支，跳过控制分支本身
+          for b in $(git for-each-ref --format='%(refname:lstrip=2)' refs/heads); do
+            if [ "$b" = "mirror-control" ]; then continue; fi
+            git push --force origin "refs/heads/${b}:refs/heads/${b}"
+          done
+
+          # tags 全量对齐（包括删除）
+          git push --force --prune origin "refs/tags/*:refs/tags/*"
+
+          echo "---- mirrored refs ----"
+          git for-each-ref --format='%(refname) %(objectname:short)'
