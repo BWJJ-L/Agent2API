@@ -34,7 +34,6 @@ jobs:
             echo "== syncing $b =="
             git checkout -B "sync/${b}" "origin/${b}"
 
-            # 先清空，再按 fork 现有版本恢复，确保上游新增的 workflow 不进入本次提交
             rm -rf .github/workflows
             if git fetch fork "+refs/heads/${b}:refs/remotes/fork/${b}" 2>/dev/null; then
               git checkout "fork/${b}" -- .github/workflows 2>/dev/null || true
@@ -55,13 +54,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
+          echo "step start"
           set -euo pipefail
+          echo "token length: ${#GH_TOKEN}"
+          echo "repo: ${REPO}"
           api="https://api.github.com/repos/${REPO}"
 
-          git ls-remote --tags https://github.com/aimod-cc/Agent2API.git \
-            | awk '$2 ~ /^refs\/tags\// && $2 !~ /\^\{\}$/ {print $2" "$1}' | sort > /tmp/up_tags.txt
-          git ls-remote --tags "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" \
-            | awk '$2 ~ /^refs\/tags\// && $2 !~ /\^\{\}$/ {print $2" "$1}' | sort > /tmp/fork_tags.txt
+          git ls-remote --tags https://github.com/aimod-cc/Agent2API.git | awk '$2 ~ /^refs\/tags\// && $2 !~ /\^\{\}$/ {print $2" "$1}' | sort > /tmp/up_tags.txt
+          git ls-remote --tags "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" | awk '$2 ~ /^refs\/tags\// && $2 !~ /\^\{\}$/ {print $2" "$1}' | sort > /tmp/fork_tags.txt
+          echo "up=$(wc -l < /tmp/up_tags.txt) fork=$(wc -l < /tmp/fork_tags.txt)"
 
           while read -r ref sha; do
             existing=$(awk -v r="$ref" '$1==r {print $2}' /tmp/fork_tags.txt)
@@ -70,15 +71,19 @@ jobs:
               echo "create $ref -> $sha"
               code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X POST \
                 -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
-                "${api}/git/refs" -d "{\"ref\":\"${ref}\",\"sha\":\"${sha}\"}")
-              cat /tmp/resp.json; echo
+                "${api}/git/refs" -d "{\"ref\":\"${ref}\",\"sha\":\"${sha}\"}" || echo curlfail)
+              echo "code=$code"
+              cat /tmp/resp.json 2>/dev/null || true
+              echo
               [ "$code" = "201" ] || exit 1
             elif [ "$existing" != "$sha" ]; then
               echo "update $ref -> $sha"
               code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X PATCH \
                 -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
-                "${api}/git/refs/${short}" -d "{\"sha\":\"${sha}\",\"force\":true}")
-              cat /tmp/resp.json; echo
+                "${api}/git/refs/${short}" -d "{\"sha\":\"${sha}\",\"force\":true}" || echo curlfail)
+              echo "code=$code"
+              cat /tmp/resp.json 2>/dev/null || true
+              echo
               [ "$code" = "200" ] || exit 1
             fi
           done < /tmp/up_tags.txt
