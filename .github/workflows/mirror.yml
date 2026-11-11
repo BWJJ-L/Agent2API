@@ -54,6 +54,7 @@ jobs:
           done
 
       - name: Mirror tags
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -101,11 +102,11 @@ jobs:
               continue
             fi
 
-            # 403 / 422 且消息提到 workflows：该 tag 指向的提交引入了 workflow 文件改动，
-            # GITHUB_TOKEN 没有 workflows 权限。这是 GitHub 的固定限制，不是脚本缺陷。
-            if { [ "$code" = "403" ] || [ "$code" = "422" ]; } && printf '%s' "$msg" | grep -q 'workflows'; then
+            # 403 表示这次 ref 写入被拒。实测：只有当 tag 指向的提交改动了
+            # .github/workflows 时才出现，原因是 GITHUB_TOKEN 没有 workflows 权限。
+            if [ "$code" = "403" ] || { [ "$code" = "422" ] && printf '%s' "$msg" | grep -q 'workflows'; }; then
               blocked="${blocked}${ref} "
-              echo "::warning::${ref} 无法同步：其提交包含 .github/workflows 变更，仓库自带 GITHUB_TOKEN 无 workflows 权限"
+              echo "::warning::${ref} 无法同步（HTTP ${code}）：其提交包含 .github/workflows 变更，仓库自带 GITHUB_TOKEN 无 workflows 权限"
               continue
             fi
 
