@@ -1,0 +1,86 @@
+name: Mirror upstream
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-upstream
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Mirror branches, keeping fork workflow files frozen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git clone https://github.com/aimod-cc/Agent2API.git upstream
+          cd upstream
+          git config user.name "mirror-bot"
+          git config user.email "mirror-bot@users.noreply.github.com"
+          git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+
+          for b in $(git ls-remote --heads origin | awk '{print $2}' | sed 's#^refs/heads/##'); do
+            echo "== syncing $b =="
+            git checkout -B "sync/${b}" "origin/${b}"
+
+            # 先清空，再按 fork 现有版本恢复，确保上游新增的 workflow 不进入本次提交
+            rm -rf .github/workflows
+            if git fetch fork "+refs/heads/${b}:refs/remotes/fork/${b}" 2>/dev/null; then
+              git checkout "fork/${b}" -- .github/workflows 2>/dev/null || true
+            fi
+            git add -A
+
+            if git diff --quiet "fork/${b}" -- . 2>/dev/null; then
+              echo "$b: no changes"
+              continue
+            fi
+
+            git commit -m "mirror: sync ${b} from upstream"
+            git push --force fork "sync/${b}:refs/heads/${b}"
+          done
+
+      - name: Sync tags via GitHub refs API
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${REPO}"
+
+          git ls-remote --tags https://github.com/aimod-cc/Agent2API.git \
+            | awk '$2 ~ /^refs\/tags\// && $2 !~ /\^\{\}$/ {print $2" "$1}' | sort > /tmp/up_tags.txt
+          git ls-remote --tags "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" \
+            | awk '$2 ~ /^refs\/tags\// && $2 !~ /\^\{\}$/ {print $2" "$1}' | sort > /tmp/fork_tags.txt
+
+          while read -r ref sha; do
+            existing=$(awk -v r="$ref" '$1==r {print $2}' /tmp/fork_tags.txt)
+            short="${ref#refs/}"
+            if [ -z "$existing" ]; then
+              echo "create $ref -> $sha"
+              code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X POST \
+                -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+                "${api}/git/refs" -d "{\"ref\":\"${ref}\",\"sha\":\"${sha}\"}")
+              cat /tmp/resp.json; echo
+              [ "$code" = "201" ] || exit 1
+            elif [ "$existing" != "$sha" ]; then
+              echo "update $ref -> $sha"
+              code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X PATCH \
+                -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+                "${api}/git/refs/${short}" -d "{\"sha\":\"${sha}\",\"force\":true}")
+              cat /tmp/resp.json; echo
+              [ "$code" = "200" ] || exit 1
+            fi
+          done < /tmp/up_tags.txt
+
+          echo "---- tag sync done ----"
