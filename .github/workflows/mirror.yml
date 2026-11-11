@@ -18,74 +18,112 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Mirror branches, keeping fork workflow files frozen
+      - name: Mirror branches (fork workflow files kept frozen)
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          git clone https://github.com/aimod-cc/Agent2API.git upstream
+          git clone --quiet https://github.com/aimod-cc/Agent2API.git upstream
           cd upstream
           git config user.name "mirror-bot"
           git config user.email "mirror-bot@users.noreply.github.com"
           git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
 
           for b in $(git ls-remote --heads origin | awk '{print $2}' | sed 's#^refs/heads/##'); do
-            echo "== syncing $b =="
-            git checkout -B "sync/${b}" "origin/${b}"
+            [ "$b" = "mirror-control" ] && continue
+            echo "== syncing branch $b =="
+            git checkout --quiet -B "sync/${b}" "origin/${b}"
 
+            # GITHUB_TOKEN 无权改动 .github/workflows，因此保留 fork 现有版本，
+            # 使本次提交的差异里不含任何 workflow 文件。
             rm -rf .github/workflows
-            if git fetch fork "+refs/heads/${b}:refs/remotes/fork/${b}" 2>/dev/null; then
+            if git fetch --quiet fork "+refs/heads/${b}:refs/remotes/fork/${b}" 2>/dev/null; then
               git checkout "fork/${b}" -- .github/workflows 2>/dev/null || true
             fi
             git add -A
 
             if git diff --quiet "fork/${b}" -- . 2>/dev/null; then
-              echo "$b: no changes"
+              echo "$b: already up to date"
               continue
             fi
 
-            git commit -m "mirror: sync ${b} from upstream"
-            git push --force fork "sync/${b}:refs/heads/${b}"
+            git commit --quiet -m "mirror: sync ${b} from upstream"
+            git push --force --quiet fork "sync/${b}:refs/heads/${b}"
+            echo "$b: pushed"
           done
 
-      - name: Sync tags via GitHub refs API
+      - name: Mirror tags
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          echo "step start"
-          set -euo pipefail
-          echo "token length: ${#GH_TOKEN}"
-          echo "repo: ${REPO}"
+          set -uo pipefail
           api="https://api.github.com/repos/${REPO}"
 
-          git ls-remote --tags https://github.com/aimod-cc/Agent2API.git | awk '$2 ~ /^refs\/tags\// && $2 !~ /\^\{\}$/ {print $2" "$1}' | sort > /tmp/up_tags.txt
-          git ls-remote --tags "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" | awk '$2 ~ /^refs\/tags\// && $2 !~ /\^\{\}$/ {print $2" "$1}' | sort > /tmp/fork_tags.txt
-          echo "up=$(wc -l < /tmp/up_tags.txt) fork=$(wc -l < /tmp/fork_tags.txt)"
+          git ls-remote --tags https://github.com/aimod-cc/Agent2API.git \
+            | awk '$2 ~ /^refs\/tags\// && $2 !~ /\^\{\}$/ {print $2" "$1}' | sort > /tmp/up_tags.txt
+          git ls-remote --tags "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" \
+            | awk '$2 ~ /^refs\/tags\// && $2 !~ /\^\{\}$/ {print $2" "$1}' | sort > /tmp/fork_tags.txt
 
+          echo "upstream tags: $(wc -l < /tmp/up_tags.txt), fork tags: $(wc -l < /tmp/fork_tags.txt)"
+
+          blocked=""
           while read -r ref sha; do
             existing=$(awk -v r="$ref" '$1==r {print $2}' /tmp/fork_tags.txt)
             short="${ref#refs/}"
             if [ -z "$existing" ]; then
-              echo "create $ref -> $sha"
-              code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X POST \
-                -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
-                "${api}/git/refs" -d "{\"ref\":\"${ref}\",\"sha\":\"${sha}\"}" || echo curlfail)
-              echo "code=$code"
-              cat /tmp/resp.json 2>/dev/null || true
-              echo
-              [ "$code" = "201" ] || exit 1
+              method=POST
+              url="${api}/git/refs"
+              body="{\"ref\":\"${ref}\",\"sha\":\"${sha}\"}"
+              want=201
+              action=create
             elif [ "$existing" != "$sha" ]; then
-              echo "update $ref -> $sha"
-              code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X PATCH \
-                -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
-                "${api}/git/refs/${short}" -d "{\"sha\":\"${sha}\",\"force\":true}" || echo curlfail)
-              echo "code=$code"
-              cat /tmp/resp.json 2>/dev/null || true
-              echo
-              [ "$code" = "200" ] || exit 1
+              method=PATCH
+              url="${api}/git/refs/${short}"
+              body="{\"sha\":\"${sha}\",\"force\":true}"
+              want=200
+              action=update
+            else
+              continue
             fi
+
+            echo "== ${action} ${ref} -> ${sha} =="
+            code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X "$method" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$url" -d "$body")
+            msg=$(cat /tmp/resp.json 2>/dev/null || true)
+            echo "HTTP $code: $msg"
+
+            if [ "$code" = "$want" ]; then
+              continue
+            fi
+
+            if printf '%s' "$msg" | grep -q 'workflows'; then
+              # 该 tag 指向的提交引入了 workflow 文件改动，GITHUB_TOKEN 无权创建。
+              # 这不是脚本缺陷，是 GitHub 的固定限制。
+              blocked="${blocked}${ref} "
+              echo "::warning::${ref} 无法同步：其提交包含 .github/workflows 变更，仓库自带 GITHUB_TOKEN 无 workflows 权限"
+              continue
+            fi
+
+            echo "::error::${ref} 同步失败，HTTP ${code}"
+            exit 1
           done < /tmp/up_tags.txt
 
-          echo "---- tag sync done ----"
+          if [ -n "$blocked" ]; then
+            {
+              echo "### 标签同步被 GitHub 权限限制拦下"
+              echo ""
+              echo "以下 tag 指向的提交包含 \`.github/workflows\` 变更，\`GITHUB_TOKEN\` 无权创建："
+              echo ""
+              for t in $blocked; do echo "- \`$t\`"; done
+              echo ""
+              echo "分支已同步完成。要补齐这些 tag，需要在有 workflows 权限的凭据下推送（本机 git 推送或 PAT）。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "blocked tags: ${blocked}"
+          else
+            echo "all tags in sync"
+          fi
