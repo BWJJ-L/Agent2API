@@ -34,15 +34,10 @@ jobs:
             echo "== syncing $b =="
             git checkout -B "sync/${b}" "origin/${b}"
 
+            # 先清空，再按 fork 现有版本恢复，确保上游新增的 workflow 不进入本次提交
+            rm -rf .github/workflows
             if git fetch fork "+refs/heads/${b}:refs/remotes/fork/${b}" 2>/dev/null; then
-              # 保留 fork 现有的 workflow 文件，避免 push 触发 workflows 权限限制
-              git checkout "fork/${b}" -- .github/workflows 2>/dev/null || {
-                git rm -r --cached .github/workflows 2>/dev/null || true
-                rm -rf .github/workflows
-              }
-            else
-              git rm -r --cached .github/workflows 2>/dev/null || true
-              rm -rf .github/workflows
+              git checkout "fork/${b}" -- .github/workflows 2>/dev/null || true
             fi
             git add -A
 
