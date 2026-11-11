@@ -18,27 +18,41 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Sync branches via merge-upstream API
+      - name: Mirror branches, keeping fork workflow files frozen
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          branches=$(git ls-remote --heads https://github.com/aimod-cc/Agent2API.git | awk '{print $2}' | sed 's#^refs/heads/##' | grep -v '^mirror-control$')
-          for b in $branches; do
+          git clone https://github.com/aimod-cc/Agent2API.git upstream
+          cd upstream
+          git config user.name "mirror-bot"
+          git config user.email "mirror-bot@users.noreply.github.com"
+          git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+
+          for b in $(git ls-remote --heads origin | awk '{print $2}' | sed 's#^refs/heads/##'); do
             echo "== syncing $b =="
-            code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X POST \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/${REPO}/merge-upstream" \
-              -d "{\"branch\":\"${b}\"}")
-            cat /tmp/resp.json
-            echo
-            if [ "$code" != "200" ]; then
-              echo "merge-upstream failed for $b: HTTP $code"
-              exit 1
+            git checkout -B "sync/${b}" "origin/${b}"
+
+            if git fetch fork "+refs/heads/${b}:refs/remotes/fork/${b}" 2>/dev/null; then
+              # 保留 fork 现有的 workflow 文件，避免 push 触发 workflows 权限限制
+              git checkout "fork/${b}" -- .github/workflows 2>/dev/null || {
+                git rm -r --cached .github/workflows 2>/dev/null || true
+                rm -rf .github/workflows
+              }
+            else
+              git rm -r --cached .github/workflows 2>/dev/null || true
+              rm -rf .github/workflows
             fi
+            git add -A
+
+            if git diff --quiet "fork/${b}" -- . 2>/dev/null; then
+              echo "$b: no changes"
+              continue
+            fi
+
+            git commit -m "mirror: sync ${b} from upstream"
+            git push --force fork "sync/${b}:refs/heads/${b}"
           done
 
       - name: Sync tags
@@ -47,8 +61,8 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          git clone --mirror https://github.com/aimod-cc/Agent2API.git upstream.git
-          cd upstream.git
+          git clone --mirror https://github.com/aimod-cc/Agent2API.git tags.git
+          cd tags.git
           git config --unset remote.origin.mirror || true
           git remote set-url --push origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
           git push --force --prune origin "refs/tags/*:refs/tags/*"
